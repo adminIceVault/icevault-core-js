@@ -1,20 +1,40 @@
+import {
+  processToWebp,
+  SUPPORTED_GRAPHIC_EXTENSIONS,
+} from "./preview-processor.js";
+
 (function () {
   "use strict";
 
-  const tmp_preview_file_name = "tmp_preview.zip";
-  const tmp_archive_file_name = "tmp_archive.zip";
+  // --- CONFIGURATION & CONSTANTS ---
+  const TMP_PREVIEW_FILENAME = "tmp_preview.zip";
+  const TMP_ARCHIVE_FILENAME = "tmp_archive.zip";
+  const DEFAULT_FALLBACK_FILENAME = "tmp_file.zip";
 
   const API = {
     INIT: "/api/storage/initiate-upload/",
     CONFIRM: "/api/storage/confirm-upload/",
-    CHUNK_SIZE: 5000 * 1024 * 1024,
+    CHUNK_SIZE: 100 * 1024 * 1024, // 100MB chunk allocation
   };
 
+  const UI_DEFAULTS = {
+    PREVIEW_MAX_WIDTH: 800,
+    PREVIEW_QUALITY: 75,
+    VIDEO_PREVIEW_DURATION: "10",
+    VIDEO_SCALE: "-2:360",
+    RETRY_ATTEMPTS: 3,
+    RETRY_DELAY_MS: 1500,
+  };
+
+  // --- EXTERNAL DEPENDENCIES INITIALIZATION ---
   const { createFFmpeg, fetchFile } = FFmpeg;
   const ffmpeg = createFFmpeg({ log: false });
   let ffmpegLoaded = false;
   window.isProcessing = false;
 
+  /**
+   * Initializes FFmpeg WASM if not already loaded.
+   */
   async function initFFmpeg() {
     if (!ffmpegLoaded) {
       await ffmpeg.load();
@@ -22,17 +42,29 @@
     }
   }
 
+  // --- RUNTIME STATE ---
   let state = {
     totalBytes: 0,
-    uploadedMap: new Map(),
-    isAnimating: false,
   };
 
-  // --- 1. ДОПОМІЖНІ ФУНКЦІЇ (HELPERS) ---
+  // --- DOM & UTILITY HELPERS ---
   const getEl = (id) => document.getElementById(id);
   const toKB = (bytes) => Math.round(bytes / 1024);
-  const getPartCount = (size) => 1;
 
+  /**
+   * Calculates the number of chunks for multi-part binary streaming.
+   * @param {number} size - File size in bytes.
+   * @returns {number} Minimum 1 part.
+   */
+  const getPartCount = function (size) {
+    console.log("Calculated part count:", size, API.CHUNK_SIZE);
+    return Math.ceil(size / API.CHUNK_SIZE) || 1;
+  };
+
+  /**
+   * Resolves the target vault filename from the DOM input or generates a timestamped fallback.
+   * @returns {string} Fully qualified zip filename.
+   */
   function getArchiveName() {
     const input = getEl("archive-name-input");
     let name = input?.value.trim();
@@ -43,23 +75,26 @@
     return name.endsWith(".zip") ? name : name + ".zip";
   }
 
+  // --- COMPILATION ENGINE (OPFS VIRTUAL FILE SYSTEM) ---
+
   /**
-   * Universal function to create a ZIP archive (plain or encrypted).
-   * @param {Array} files - Array of File objects or objects with {name, data}.
-   * @param {string} filename - Output filename.
-   * @param {string|null} password - Optional password for AES-256 encryption.
-   * @returns {Promise<File>}
+   * Universal streaming compiler that writes a ZIP archive (plain or AES-256 encrypted)
+   * directly to the Origin Private File System (OPFS) to bypass browser memory thresholds.
+   * @param {Array} files - Array of unified file nodes or objects containing {name, data, archivePath}.
+   * @param {string} filename - Destined storage asset identifier.
+   * @param {string} tmp_filename - Sandbox block tracking handle.
+   * @param {string|null} password - Private key for AES-256 payload encryption.
+   * @returns {Promise<File>} Hand-off descriptor for AWS binary transmission.
    */
   async function createZipArchive(
     files,
     filename,
-    tmp_filename = "tmp_file.zip",
+    tmp_filename = DEFAULT_FALLBACK_FILENAME,
     password = null,
   ) {
-    // 1. Доступ до OPFS
     const root = await navigator.storage.getDirectory();
 
-    // Очищення старого файлу
+    // Evict old allocation tracks if they exist
     try {
       await root.removeEntry(tmp_filename);
     } catch (e) {}
@@ -68,14 +103,13 @@
       create: true,
     });
 
-    // 2. Створюємо WritableStream
+    // Create a high-performance raw writable interface stream
     const writableStream = await tempFileHandle.createWritable();
-
     const zipConfig = { bufferedWrite: true };
 
     window.UploadModalManager.updateProgress(0, "packing_payload");
 
-    // 1. Рахуємо загальний розмір усіх файлів для плавного прогресу
+    // Aggregate baseline bytes for fine-grained compression telemetry
     const totalBytes = files.reduce((acc, file) => {
       const data = file.data !== undefined ? file.data : file;
       return acc + (data.size || 0);
@@ -85,14 +119,13 @@
 
     if (password && password.trim() !== "") {
       zipConfig.password = password.trim();
-      zipConfig.zipCrypto = false; // AES-256
+      zipConfig.zipCrypto = false; // Force modern AES-256 compliance over legacy ZipCrypto
 
       window.UploadModalManager.writeLog(
         `SECURE_UPLINK: Encrypting vault with AES-256 (OPFS Mode)...`,
       );
     }
 
-    // Використовуємо наш стрім-врайтер замість BlobWriter
     const zipWriter = new zip.ZipWriter(writableStream, zipConfig);
     try {
       let currentFileIndex = 0;
@@ -101,22 +134,19 @@
       for (const file of files) {
         currentFileIndex++;
 
-        // 1. Визначаємо правильний шлях всередині архіву
         const data = file.data !== undefined ? file.data : file;
         const name = file.name;
-        const archivePath = file.archivePath || name; // Пріоритет для шляху папки
+        const archivePath = file.archivePath || name; // Maintain strict nested tree hierarchy
         const fileSize = data.size || 0;
 
         const blobReader = new zip.BlobReader(
           data instanceof Blob ? data : new Blob([data]),
         );
 
-        // Логуємо відносний шлях, щоб користувач бачив структуру папок у терміналі
         window.UploadModalManager.writeLog(
           `PACKING: [${currentFileIndex}/${totalFilesCount}] ${archivePath}...`,
         );
 
-        // 2. Передаємо archivePath замість name. zip.js сам побудує дерево каталогів!
         await zipWriter.add(archivePath, blobReader, {
           onprogress: (loaded, total) => {
             if (!totalBytes || totalBytes === 0) return;
@@ -148,9 +178,7 @@
         `SUCCESS: Vault compiled on storage. Ready for AWS transmission.`,
       );
 
-      // 4. Отримуємо готовий файл з диска
       const finalFile = await tempFileHandle.getFile();
-
       window.UploadModalManager.writeLog(`SUCCESS: Archive ready on disk.`);
 
       return new File([finalFile], filename, { type: "application/zip" });
@@ -160,25 +188,25 @@
       );
       console.error(`[Archive] Error:`, error);
       throw error;
-    } finally {
-      console.log('done')
-    }
     }
   }
+
   /**
-   * Processes files and generates preview content (thumbs, clips, or markers).
-   * Returns an array of { name, data } objects.
+   * Generates derivative low-fidelity quick-view assets (WebP thumbs, lightweight MP4 streams, metadata).
+   * @param {Array} files - Raw queue buffers.
+   * @returns {Promise<Array>} Non-destructive structural projection of asset proxies.
    */
   async function generatePreviewContent(files) {
     const previewFiles = [];
     const maxWidth = parseInt(
-      document.getElementById("preview-size-input")?.value || 800,
+      getEl("preview-size-input")?.value || UI_DEFAULTS.PREVIEW_MAX_WIDTH,
     );
     const quality =
-      parseInt(document.getElementById("preview-quality-input")?.value || 75) /
-      100;
+      parseInt(
+        getEl("preview-quality-input")?.value || UI_DEFAULTS.PREVIEW_QUALITY,
+      ) / 100;
     const isUploadingOriginals =
-      document.getElementById("upload-originals-checkbox")?.checked ?? true;
+      getEl("upload-originals-checkbox")?.checked ?? true;
 
     for (const file of files) {
       const originalPath = file.archivePath || file.name;
@@ -189,24 +217,28 @@
           : "";
 
       try {
-        // 1. IMAGES
-        if (file.type.startsWith("image/")) {
-          const options = {
-            maxWidthOrHeight: maxWidth,
-            initialQuality: quality,
-            useWebWorker: true,
-            fileType: "image/jpeg",
-          };
-          const thumb = await window.imageCompression(file, options);
+        let isImage = file.type.startsWith("image/");
+        const fileExtension = file.name?.split(".").pop().toLowerCase();
+        if (SUPPORTED_GRAPHIC_EXTENSIONS.includes(fileExtension)) {
+          isImage = true;
+        }
 
-          const newName = `thumb_${file.name}.jpg`;
+        // 1. IMAGE PROCESSING
+        if (isImage) {
+          const compressed = await processToWebp(file, {
+            maxWidthOrHeight: maxWidth,
+            quality: quality,
+            outputFormat: "image/webp",
+          });
+
+          const newName = `thumb_${file.name}.webp`;
           previewFiles.push({
             name: newName,
-            archivePath: dirPath + newName, // Зберігаємо структуру папок!
-            data: thumb,
+            archivePath: dirPath + newName,
+            data: compressed,
           });
         }
-        // 2. VIDEO
+        // 2. VIDEO PROCESSING (WASM TRANSCODING)
         else if (file.type.startsWith("video/")) {
           window.UploadModalManager.writeLog(
             `Processing video preview: ${file.name}...`,
@@ -216,11 +248,11 @@
           ffmpeg.FS("writeFile", "temp_input", await fetchFile(file));
           await ffmpeg.run(
             "-t",
-            "10",
+            UI_DEFAULTS.VIDEO_PREVIEW_DURATION,
             "-i",
             "temp_input",
             "-vf",
-            "scale=-2:360,eq=saturation=1.2",
+            `scale=${UI_DEFAULTS.VIDEO_SCALE},eq=saturation=1.2`,
             "-preset",
             "ultrafast",
             "-c:v",
@@ -234,42 +266,34 @@
           );
 
           const data = ffmpeg.FS("readFile", "fast_preview.mp4");
-
           const newName = `preview_${file.name.split(".")[0]}.mp4`;
+
           previewFiles.push({
             name: newName,
-            archivePath: dirPath + newName, // Зберігаємо структуру папок!
+            archivePath: dirPath + newName,
             data: data.buffer,
           });
 
           ffmpeg.FS("unlink", "temp_input");
           ffmpeg.FS("unlink", "fast_preview.mp4");
         }
-        // 3. TEXT
+        // 3. PLAINTEXT / INSPECTION LOGS
         else if (file.type === "text/plain" || file.name.endsWith(".log")) {
           const text = await file.text();
           const newName = `meta_${file.name}`;
           previewFiles.push({
             name: newName,
-            archivePath: dirPath + newName, // Зберігаємо структуру папок!
+            archivePath: dirPath + newName,
             data: text,
           });
         }
-        // 4. OTHERS / MARKERS
+        // 4. PLACEHOLDERS / ARCHIVE INDEX TRACKERS
         else {
-          if (!isUploadingOriginals) {
-            previewFiles.push({
-              name: file.name,
-              archivePath: originalPath, // Залишаємо оригінальний шлях
-              data: file,
-            });
-          } else {
-            previewFiles.push({
-              name: file.name,
-              archivePath: originalPath, // Маркер лежить за тим же шляхом, що й оригінал
-              data: "",
-            });
-          }
+          previewFiles.push({
+            name: file.name,
+            archivePath: originalPath,
+            data: !isUploadingOriginals ? file : "",
+          });
         }
       } catch (e) {
         window.UploadModalManager.writeLog(
@@ -278,7 +302,7 @@
         );
         previewFiles.push({
           name: file.name,
-          archivePath: originalPath, // Фолбек-маркер теж кладемо на своє місце
+          archivePath: originalPath,
           data: "",
         });
         console.error(e);
@@ -287,6 +311,9 @@
     return previewFiles;
   }
 
+  /**
+   * Generates standard cryptographic MD5 checksum.
+   */
   function calculateMD5(file) {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -300,89 +327,222 @@
     });
   }
 
-  async function uploadToS3(target, fields, file, typeLabel) {
+  // --- 3. NETWORK TRANSMISSION LAYER (S3 / CLOUDFLARE R2 UPLINK) ---
+
+  /**
+   * Handles binary stream transmission to object storage destination targets.
+   * Automatically isolates Multi-part parallel processing from single PUT pipeline tracking.
+   * @param {Object} uploadMeta - Infrastructure signing profiles from server response block.
+   * @param {File} file - Physical binary payload asset hook.
+   * @param {string} typeLabel - Contextual runtime debugging tag ("PREVIEW" | "ARCHIVE").
+   * @returns {Promise<Object>} MD5 checksum structure mappings for tracking validation.
+   */
+  async function uploadToS3(uploadMeta, file, typeLabel) {
     window.UploadModalManager.updateProgress(0, "uploading_stream");
 
-    const formData = new FormData();
+    const uploadType = uploadMeta.upload_type;
+    const partsUrls = uploadMeta.part_urls || {};
+    const targetUrl = partsUrls[1] || partsUrls["1"] || uploadMeta.url;
 
-    // 1. Формуємо поля та логуємо їх
-    console.group(`[DEBUG] FormData Fields`);
-    Object.keys(fields).forEach((key) => {
-      const value = fields[key] || file.type;
-      formData.append(key, value);
-    });
+    if (!targetUrl) {
+      throw new Error(`No URL provided for uploading ${typeLabel}`);
+    }
 
-    // 2. Визначаємо правильне ім'я для S3
-    // S3 POST вимагає, щоб файл був останнім полем
-    const s3Key = fields["key"] || "unknown_file";
-    const originalName = s3Key.split("/").pop();
-    formData.append("file", file, originalName);
-    console.groupEnd();
+    // --- MULTI-PART ACCELERATED TRANSMISSION ---
+    if (uploadType === "multipart") {
+      const partSize = API.CHUNK_SIZE;
+      const totalParts = Object.keys(partsUrls).length;
+      const completedPartsHashes = {};
 
-    try {
-      console.log(`[DEBUG] Sending Axios POST request...`);
+      console.group(`[MULTIPART PUT] ${typeLabel}`);
 
-      const response = await axios.post(target, formData, {
-        onUploadProgress: (e) => {
-          const percent = Math.round((e.loaded * 100) / e.total);
-          window.UploadModalManager.updateProgress(percent, "uploading_stream");
-        },
-        // ВАЖЛИВО: для POST Policy НЕ ставимо manual Content-Type
-        // Браузер має сам виставити multipart/form-data з boundary
-      });
+      try {
+        for (let i = 1; i <= totalParts; i++) {
+          const chunkUrl = partsUrls[i] || partsUrls[String(i)];
+          if (!chunkUrl) throw new Error(`Missing URL for part ${i}`);
 
-      console.log(`[DEBUG] Response received:`, response.status);
-      console.log(`[DEBUG] Response Headers:`, response.headers);
+          const start = (i - 1) * partSize;
+          const end = Math.min(start + partSize, file.size);
+          const chunk = file.slice(start, end);
 
-      const etag = response.headers["etag"] || response.headers["ETag"];
-      const cleanEtag = etag ? etag.replace(/"/g, "") : null;
-      window.UploadModalManager.writeLog(
-        `${typeLabel} uploaded. Hash: ${cleanEtag}`,
-        "success",
-      );
+          let attempt = 0;
+          let success = false;
+          let response;
 
-      return cleanEtag;
-    } catch (err) {
-      console.group(`[DEBUG] Upload Error`);
-      console.error(`Status: ${err.response?.status}`);
-      console.error(`Error Code: ${err.code}`);
+          // Fault-tolerant stream looping block
+          while (attempt < UI_DEFAULTS.RETRY_ATTEMPTS && !success) {
+            try {
+              attempt++;
+              if (attempt > 1) {
+                window.UploadModalManager.writeLog(
+                  `RETRY: Retrying part ${i}/${totalParts} (Attempt ${attempt}/${UI_DEFAULTS.RETRY_ATTEMPTS})...`,
+                  "warning",
+                );
+                await new Promise((resolve) =>
+                  setTimeout(resolve, UI_DEFAULTS.RETRY_DELAY_MS),
+                );
+              } else {
+                window.UploadModalManager.writeLog(
+                  `STREAMING: Sending part ${i}/${totalParts} (${toKB(chunk.size)} KB)...`,
+                );
+              }
 
-      if (err.response?.data) {
-        console.error(`Server Response Data:`, err.response.data);
-        // Спробуємо розпарсити XML помилку, якщо вона є
-        const reader = new FileReader();
-        reader.onload = () => console.warn("Parsed XML Error:", reader.result);
-        if (err.response.data instanceof Blob) {
-          reader.readAsText(err.response.data);
+              response = await axios.put(chunkUrl, chunk, {
+                headers: { "Content-Type": "application/octet-stream" },
+                onUploadProgress: (e) => {
+                  const loadedBefore = (i - 1) * partSize;
+                  const currentTotalLoaded = loadedBefore + e.loaded;
+                  const percent = Math.min(
+                    Math.round((currentTotalLoaded * 100) / file.size),
+                    100,
+                  );
+                  window.UploadModalManager.updateProgress(
+                    percent,
+                    "uploading_stream",
+                  );
+                },
+              });
+
+              success = true;
+            } catch (chunkErr) {
+              console.warn(`Part ${i} failed on attempt ${attempt}:`, chunkErr);
+              if (attempt >= UI_DEFAULTS.RETRY_ATTEMPTS) {
+                throw new Error(
+                  `Failed to upload part ${i} after ${UI_DEFAULTS.RETRY_ATTEMPTS} attempts. Error: ${chunkErr.message}`,
+                );
+              }
+            }
+          }
+
+          const etag = response.headers["etag"] || response.headers["ETag"];
+          if (!etag)
+            throw new Error(`Server did not return ETag for part ${i}`);
+
+          completedPartsHashes[i] = etag.replace(/"/g, "");
         }
-      }
-      console.groupEnd();
 
+        console.groupEnd();
+        window.UploadModalManager.writeLog(
+          `${typeLabel} multipart streaming complete.`,
+          "success",
+        );
+        return completedPartsHashes;
+      } catch (err) {
+        console.groupEnd();
+        throw err;
+      }
+    }
+    // --- SINGLE TRANSACTION PUT (Optimized Clean Preview Uplink) ---
+    else {
+      console.group(`[SINGLE PUT] ${typeLabel}`);
       window.UploadModalManager.writeLog(
-        `Upload failed: ${typeLabel}`,
-        "error",
+        `STREAMING: Sending preview via PUT...`,
       );
-      throw err;
+
+      // Динамічно збираємо заголовки, які БЕКЕНД встиг зашити в підпис URL
+      const dynamicHeaders = {};
+      try {
+        const urlObj = new URL(targetUrl);
+        const signedHeadersStr =
+          urlObj.searchParams.get("X-Amz-SignedHeaders") || "";
+
+        if (signedHeadersStr) {
+          const signedHeaders = signedHeadersStr.split(";");
+
+          // 1. Обов'язково додаємо Content-Type, якщо він є в підписі
+          if (signedHeaders.includes("content-type")) {
+            dynamicHeaders["Content-Type"] = "application/zip";
+          }
+
+          // 2. Якщо бек підписав Storage Class — фронт зобов'язаний його передати
+          if (signedHeaders.includes("x-amz-storage-class")) {
+            dynamicHeaders["X-Amz-Storage-Class"] =
+              uploadMeta.storage_class || "STANDARD";
+          }
+
+          // 3. Якщо бек все ще підписує метадані (про всяк випадок, якщо забув прибрати на беку)
+          if (signedHeaders.includes("x-amz-meta-is-encrypted")) {
+            dynamicHeaders["X-Amz-Meta-Is-Encrypted"] = String(
+              uploadMeta.is_encrypted !== undefined
+                ? uploadMeta.is_encrypted
+                : "false",
+            );
+          }
+          if (signedHeaders.includes("x-amz-meta-password-hint")) {
+            // Захист від порожнього рядка, який ламає підпис
+            dynamicHeaders["X-Amz-Meta-Password-Hint"] = String(
+              uploadMeta.password_hint || "none",
+            );
+          }
+          if (signedHeaders.includes("x-amz-meta-file-count")) {
+            dynamicHeaders["X-Amz-Meta-File-Count"] = String(
+              uploadMeta.file_count || "0",
+            );
+          }
+        }
+      } catch (pErr) {
+        console.error("Failed to parse signed headers from URL", pErr);
+      }
+
+      console.log(
+        `Sending PUT with dynamic headers based on signature:`,
+        dynamicHeaders,
+      );
+
+      try {
+        // Для AWS S3 регістр літер неважливий, але для Cloudflare R2 краще
+        // привести ключі до нижнього регістру, якщо вони підписані як x-amz-*
+        const normalizedHeaders = {};
+        Object.keys(dynamicHeaders).forEach((key) => {
+          normalizedHeaders[key.toLowerCase()] = dynamicHeaders[key];
+        });
+        // Зберігаємо правильний Content-Type
+        if (dynamicHeaders["Content-Type"])
+          normalizedHeaders["Content-Type"] = "application/zip";
+
+        const response = await axios.put(targetUrl, file, {
+          headers: normalizedHeaders,
+          onUploadProgress: (e) => {
+            const percent = Math.round((e.loaded * 100) / e.total);
+            window.UploadModalManager.updateProgress(
+              percent,
+              "uploading_stream",
+            );
+          },
+        });
+
+        const etag = response.headers["etag"] || response.headers["ETag"];
+        const cleanEtag = etag ? etag.replace(/"/g, "") : null;
+
+        console.groupEnd();
+        window.UploadModalManager.writeLog(
+          `${typeLabel} uploaded successfully via Single PUT.`,
+          "success",
+        );
+
+        return { 1: cleanEtag };
+      } catch (err) {
+        console.groupEnd();
+        throw err;
+      }
     }
   }
 
-  // Step 1: Prepare and Build Packages
+  /**
+   * Parallel package assembler coordinator.
+   */
   const buildPackages = async (files) => {
-    const password = window.vaultEncryptionPassword; // Accessing our global variable
-
-    // 1. Prepare Archive Tasks
+    const password = window.vaultEncryptionPassword;
     const tasks = [];
 
-    // 2. Main Archive Task (Originals)
-    const isUploadingOriginals = document.getElementById(
-      "upload-originals-checkbox",
-    )?.checked;
+    // Evaluate Original Archives Pipeline Task Allocation
+    const isUploadingOriginals = getEl("upload-originals-checkbox")?.checked;
     if (isUploadingOriginals) {
       tasks.push(
         createZipArchive(
           files,
           getArchiveName(),
-          tmp_archive_file_name,
+          TMP_ARCHIVE_FILENAME,
           password,
         ),
       );
@@ -390,16 +550,15 @@
       tasks.push(Promise.resolve(null));
     }
 
-    // 3. Preview Archive Task
-    const isPreviewEnabled = document.getElementById("enable-preview")?.checked;
+    // Evaluate Preview Proxies Pipeline Task Allocation
+    const isPreviewEnabled = getEl("enable-preview")?.checked;
     if (isPreviewEnabled) {
-      // First generate content, then zip it
       const generateAndZipPreview = async () => {
         const previewContent = await generatePreviewContent(files);
         return await createZipArchive(
           previewContent,
           `preview_${getArchiveName()}`,
-          tmp_preview_file_name,
+          TMP_PREVIEW_FILENAME,
           password,
         );
       };
@@ -408,17 +567,16 @@
       tasks.push(Promise.resolve(null));
     }
 
-    // 4. Run building in parallel
     const [archiveFile, previewFile] = await Promise.all(tasks);
-
     return { archiveFile, previewFile };
   };
 
-  // --- 4. ОРКЕСТРАТОР (MAIN FLOW) ---
+  // --- 4. ENGINE ORCHESTRATOR (MAIN PROCESS EXECUTION FLOW) ---
   async function startExecution() {
     const files = window.fileQueue || [];
-    if (files.length === 0)
+    if (files.length === 0) {
       return window.UploadModalManager.writeLog("Queue is empty", "warn");
+    }
 
     window.UploadModalManager.open();
     window.UploadModalManager.setPackingState();
@@ -432,14 +590,13 @@
     try {
       btn.disabled = true;
       window.isProcessing = true;
-      state.uploadedMap.clear();
 
-      // Етап 1: Побудова пакетів
+      // Pipeline Stage 1: Build Local Binary Archives via OPFS
       const { archiveFile, previewFile } = await buildPackages(files);
       const params = new URLSearchParams(window.location.search);
       const collectionId = params.get("collectionId");
-      console.log("storageClass", storageClass);
-      // Етап 2: Реєстрація на бекенді
+
+      // Pipeline Stage 2: Register Upload Transactions on Server Backend
       const payload = {
         collection_id: collectionId,
         archive: archiveFile
@@ -460,7 +617,8 @@
               preview_size_kb: toKB(previewFile.size),
               preview_part_count: getPartCount(previewFile.size),
               file_count: files.length,
-              storage_class: "GLACIER_IR",
+              storage_class:
+                storageClass === "STANDARD" ? "STANDARD" : "GLACIER_IR",
               chunk_size_kb: toKB(API.CHUNK_SIZE),
               is_encrypted: !!window.vaultEncryptionPassword,
               password_hint: window.vaultPasswordHint,
@@ -471,72 +629,54 @@
       const initData = await window.requester("POST", API.INIT, payload);
       if (initData.status !== "Ok") throw new Error(initData.message);
 
-      // Етап 3: Завантаження
+      // Pipeline Stage 3: Direct Core Binary Streaming to Storage Destinations
       state.totalBytes = (archiveFile?.size || 0) + (previewFile?.size || 0);
       const uploadTasks = [];
-      let archiveEtag = null;
-      let previewEtag = null;
+      let archivePartsMap = {};
+      let previewPartsMap = {};
 
-      // 1. Створюємо чергу завдань
       if (previewFile && initData.preview) {
         window.UploadModalManager.writeLog(
-          "Streaming PREVIEWS to GLACIER_IR...",
+          "Processing preview transmission...",
         );
         const previewTask = uploadToS3(
-          initData.preview.url,
-          initData.preview.fields,
+          initData.preview,
           previewFile,
           "PREVIEW",
-        ).then((etag) => {
-          previewEtag = etag;
-        }); // Зберігаємо хеш після завершення
-
+        ).then((hashesMap) => {
+          previewPartsMap = hashesMap;
+        });
         uploadTasks.push(previewTask);
       }
 
       if (archiveFile && initData.archive) {
         window.UploadModalManager.writeLog(
-          `Streaming ARCHIVE to ${storageClass}...`,
+          `Processing archive transmission...`,
         );
         const archiveTask = uploadToS3(
-          initData.archive.url,
-          initData.archive.fields,
+          initData.archive,
           archiveFile,
           "ARCHIVE",
-        ).then((etag) => {
-          archiveEtag = etag;
-        }); // Зберігаємо хеш після завершення
-
+        ).then((hashesMap) => {
+          archivePartsMap = hashesMap;
+        });
         uploadTasks.push(archiveTask);
       }
 
-      // 2. Чекаємо на завершення всіх завантажень
-      // Якщо будь-яке завантаження впаде, Promise.all викине помилку,
-      // яку обробить зовнішній try/catch
+      // Synchronize parallel upload tasks resolution
       await Promise.all(uploadTasks);
 
-      // 3. Відправляємо підтвердження на бекенд
+      // Pipeline Stage 4: Commit Integrity Checksums to Finalize Storage Lifecycle
       window.UploadModalManager.writeLog(
-        "Finalizing upload and verifying integrity...",
+        "Finalizing checksums and committing payload...",
         "info",
       );
-      // Етап 4: Підтвердження
-      window.UploadModalManager.writeLog("Finalizing checksums...");
 
       const confirmPayload = {
         uuid: initData.uuid,
-        archive_hashes: {},
-        preview_hashes: {},
+        archive_hashes: archivePartsMap,
+        preview_hashes: previewPartsMap,
       };
-
-      // 2. Додаємо дані лише якщо вони існують
-      if (archiveEtag) {
-        confirmPayload.archive_hashes[1] = archiveEtag;
-      }
-
-      if (previewEtag) {
-        confirmPayload.preview_hashes[1] = previewEtag;
-      }
 
       await window.requester("POST", API.CONFIRM, confirmPayload);
 
@@ -545,21 +685,30 @@
         "Payload committed. Integrity hashes verified successfully.",
       );
       UploadModalManager.setSuccessState();
+
       window.fileQueue = [];
       if (window.renderTable) window.renderTable();
     } catch (err) {
+      console.error(err);
       window.UploadModalManager.writeLog(
         `CRITICAL_FAILURE: ${err.message}`,
         "error",
       );
-      console.error(err);
+
+      // Null-safe evaluation for axios/server-side validation messages
+      if (err?.response?.data?.message) {
+        window.UploadModalManager.writeLog(
+          `CRITICAL_FAILURE: ${err.response.data.message}`,
+          "error",
+        );
+      }
     } finally {
       btn.disabled = false;
       window.isProcessing = false;
     }
   }
 
-  // --- ІНІЦІАЛІЗАЦІЯ ---
+  // --- INITIALIZATION INTERFACE ATTACHMENT ---
   document.addEventListener("DOMContentLoaded", () => {
     getEl("start-upload-btn")?.addEventListener("click", startExecution);
   });
